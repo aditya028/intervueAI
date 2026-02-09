@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: intervueai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: intervue_ai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: intervueai-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # LiveKit Server
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: intervueai-livekit
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    ports:
+      - "7880:7880"   # HTTP
+      - "7881:7881"   # WebRTC TCP
+      - "50000-50100:50000-50100/udp"  # WebRTC UDP
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml
+
+volumes:
+  postgres_data:
+  redis_data:
