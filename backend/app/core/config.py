@@ -29,6 +29,21 @@ class Settings(BaseSettings):
     INTERVIEW_DURATION_MINUTES: int = 60
     INTERVIEW_MAX_DURATION_MINUTES: int = 75  # 1hr 15min max
 
+    # JWT Auth
+    JWT_SECRET_KEY: str = "change-me-to-a-random-secret-key-in-production"
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRY_MINUTES: int = 1440  # 24 hours
+
+    # Email (Gmail SMTP)
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_EMAIL: str = ""
+    SMTP_PASSWORD: str = ""  # Gmail App Password
+
+    # OTP Settings
+    OTP_LENGTH: int = 6
+    OTP_EXPIRY_SECONDS: int = 600  # 10 minutes
+
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
 

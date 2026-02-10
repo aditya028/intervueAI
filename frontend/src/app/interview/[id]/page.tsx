@@ -25,10 +25,12 @@ type InterviewStatus =
   | "generating_review"
   | "error";
 
-// ---- Debug logger (check browser console for [IntervueAI] messages) ----
 function log(...args: any[]) {
   console.log("[IntervueAI]", ...args);
 }
+
+// ---- Silence debounce duration (ms) ----
+const SILENCE_WAIT_MS = 5000;
 
 export default function InterviewPage() {
   const params = useParams();
@@ -46,15 +48,20 @@ export default function InterviewPage() {
     { speaker: "ai" | "user"; text: string }[]
   >([]);
 
-  // ---- Refs (updated DIRECTLY, not through useEffect) ----
+  // ---- Refs ----
   const recognitionRef = useRef<any>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const synthRef = useRef<SpeechSynthesis | null>(null);
-  const isMutedRef = useRef(false);
   const statusRef = useRef<InterviewStatus>("connecting");
+  const isMutedRef = useRef(false);
   const elapsedRef = useRef(0);
   const interviewEndedRef = useRef(false);
-  const loopActiveRef = useRef(false); // Prevents double-starting the loop
+
+  // ---- Speech buffer + silence timer for debounce ----
+  const speechBufferRef = useRef<string>("");
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isProcessingRef = useRef(false);
+  const aiSpeakingRef = useRef(false);
 
   // Auto-scroll transcript
   useEffect(() => {
@@ -73,7 +80,7 @@ export default function InterviewPage() {
     return () => clearInterval(interval);
   }, [status]);
 
-  // Initialize speech synthesis & preload voices
+  // Initialize speech synthesis
   useEffect(() => {
     if (typeof window === "undefined") return;
     synthRef.current = window.speechSynthesis;
@@ -83,7 +90,8 @@ export default function InterviewPage() {
     };
   }, []);
 
-  // ---- Helper: format time ----
+  // ---- Helpers ----
+
   function formatTime(seconds: number) {
     const hrs = Math.floor(seconds / 3600);
     const mins = Math.floor((seconds % 3600) / 60);
@@ -94,17 +102,30 @@ export default function InterviewPage() {
     return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
   }
 
-  // ---- Speech Synthesis with Chrome bug workarounds ----
+  function createRecognition(): any {
+    const w = window as any;
+    const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
+    if (!Ctor) return null;
+
+    const recognition = new Ctor();
+    recognition.continuous = true;        // Keep listening continuously
+    recognition.interimResults = true;    // Get partial results for interruption detection
+    recognition.lang = "en-US";
+    recognition.maxAlternatives = 1;
+    return recognition;
+  }
+
+  // ---- TTS with Chrome workarounds ----
+
   function speakText(text: string): Promise<void> {
     return new Promise((resolve) => {
       if (!synthRef.current) {
-        log("No speechSynthesis available, skipping TTS");
         resolve();
         return;
       }
 
-      // Cancel any ongoing speech
       synthRef.current.cancel();
+      aiSpeakingRef.current = true;
       setAiSpeaking(true);
 
       const utterance = new SpeechSynthesisUtterance(text);
@@ -129,30 +150,26 @@ export default function InterviewPage() {
         resolved = true;
         clearInterval(chromeResumeHack);
         clearTimeout(safetyTimeout);
+        aiSpeakingRef.current = false;
         setAiSpeaking(false);
         log("TTS finished");
         resolve();
       };
 
       utterance.onend = done;
-      utterance.onerror = (e) => {
-        log("TTS error:", e);
-        done();
-      };
+      utterance.onerror = () => done();
 
-      // CHROME BUG WORKAROUND #1: Chrome pauses SpeechSynthesis after ~15s.
-      // Periodically calling resume() prevents it from getting stuck.
+      // Chrome bug workaround: prevent TTS from pausing after ~15s
       const chromeResumeHack = setInterval(() => {
         if (synthRef.current && synthRef.current.speaking) {
           synthRef.current.resume();
         }
       }, 5000);
 
-      // CHROME BUG WORKAROUND #2: Safety timeout in case onend never fires.
-      // Estimate ~80ms per character + 5s buffer, minimum 10s.
+      // Safety timeout in case onend never fires
       const estimatedMs = Math.max(text.length * 80 + 5000, 10000);
       const safetyTimeout = setTimeout(() => {
-        log("TTS safety timeout fired after", estimatedMs, "ms — forcing resolve");
+        log("TTS safety timeout — forcing resolve");
         if (synthRef.current) synthRef.current.cancel();
         done();
       }, estimatedMs);
@@ -162,139 +179,163 @@ export default function InterviewPage() {
     });
   }
 
-  // ---- Speech Recognition ----
-  function createRecognition(): any {
-    const w = window as any;
-    const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (!Ctor) return null;
-
-    const recognition = new Ctor();
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.lang = "en-US";
-    recognition.maxAlternatives = 1;
-    return recognition;
+  /** Stop AI speech immediately (for user interruption). */
+  function cancelSpeech() {
+    if (synthRef.current) {
+      synthRef.current.cancel();
+    }
+    aiSpeakingRef.current = false;
+    setAiSpeaking(false);
   }
+
+  // ---- Recognition lifecycle ----
 
   function stopListening() {
     if (recognitionRef.current) {
-      try {
-        recognitionRef.current.abort();
-      } catch (_) {
-        /* ignore */
-      }
+      try { recognitionRef.current.stop(); } catch (_) { /* ignore */ }
       recognitionRef.current = null;
     }
     setIsListening(false);
   }
 
-  // ---- The core loop: listen → sendToAI → speakText → listen ----
-  // All functions read state from refs (updated synchronously), never from
-  // React state captured in closures.
-
+  /**
+   * Start continuous recognition.
+   * - Accumulates speech into a buffer.
+   * - On silence (no new results for SILENCE_WAIT_MS), sends buffer to AI.
+   * - If user speaks while AI is talking, cancels TTS immediately.
+   */
   function startListening() {
-    // Guards
     if (isMutedRef.current) {
-      log("startListening: skipped — muted");
+      log("startListening: skipped (muted)");
       return;
     }
     if (statusRef.current !== "active") {
-      log("startListening: skipped — status is", statusRef.current);
+      log("startListening: skipped (status:", statusRef.current, ")");
       return;
     }
 
-    log("startListening: starting speech recognition");
+    // Stop any existing recognition
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch (_) { /* ignore */ }
+    }
+
+    const recognition = createRecognition();
+    if (!recognition) {
+      setError("Speech recognition not supported. Please use Chrome or Edge.");
+      return;
+    }
+    recognitionRef.current = recognition;
+
+    log("startListening: starting continuous recognition");
+
+    recognition.onstart = () => {
+      log("STT: started");
+      setIsListening(true);
+    };
+
+    recognition.onresult = (event: any) => {
+      // Process all new results
+      let interimText = "";
+      let finalText = "";
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) {
+          finalText += result[0].transcript + " ";
+        } else {
+          interimText += result[0].transcript;
+        }
+      }
+
+      // ---- Interruption detection ----
+      // If AI is speaking and user starts talking, cancel TTS immediately
+      if (aiSpeakingRef.current && (finalText.trim() || interimText.trim())) {
+        log("User interrupted AI speech — cancelling TTS");
+        cancelSpeech();
+      }
+
+      // Don't accumulate while AI is still speaking or processing
+      if (isProcessingRef.current) return;
+
+      // Accumulate final text into buffer
+      if (finalText.trim()) {
+        speechBufferRef.current += finalText;
+        log("Buffer:", speechBufferRef.current.trim().substring(0, 80));
+      }
+
+      // Reset silence timer — wait SILENCE_WAIT_MS after last speech
+      if (finalText.trim() || interimText.trim()) {
+        if (silenceTimerRef.current) {
+          clearTimeout(silenceTimerRef.current);
+        }
+
+        // Only start the silence timer on final results (actual words)
+        if (finalText.trim()) {
+          silenceTimerRef.current = setTimeout(() => {
+            const buffered = speechBufferRef.current.trim();
+            if (buffered && !isProcessingRef.current) {
+              log("Silence timer fired — sending buffered speech:", buffered.substring(0, 80));
+              speechBufferRef.current = "";
+              sendToAI(buffered);
+            }
+          }, SILENCE_WAIT_MS);
+        }
+      }
+    };
+
+    recognition.onerror = (event: any) => {
+      const errCode = event.error;
+      log("STT error:", errCode);
+
+      if (errCode === "no-speech" || errCode === "aborted") {
+        // These are benign — recognition will restart via onend
+      } else if (errCode === "not-allowed") {
+        setIsListening(false);
+        setError(
+          "Microphone access denied. Click the lock icon in the address bar, allow microphone, then reload."
+        );
+      } else if (errCode === "audio-capture") {
+        setIsListening(false);
+        setError("No microphone found. Please connect a microphone and reload.");
+      } else {
+        // Transient error — will restart via onend
+        console.error("Speech recognition error:", errCode);
+      }
+    };
+
+    recognition.onend = () => {
+      log("STT: ended");
+      setIsListening(false);
+
+      // Auto-restart if interview is still active and not muted
+      if (
+        statusRef.current === "active" &&
+        !isMutedRef.current &&
+        !interviewEndedRef.current
+      ) {
+        log("STT: auto-restarting recognition");
+        setTimeout(() => startListening(), 300);
+      }
+    };
 
     try {
-      const recognition = createRecognition();
-      if (!recognition) {
-        setError("Speech recognition not supported. Please use Chrome or Edge.");
-        return;
-      }
-
-      // Stop any existing recognition first
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch (_) {
-          /* ignore */
-        }
-      }
-      recognitionRef.current = recognition;
-
-      let gotResult = false;
-
-      recognition.onstart = () => {
-        log("STT: listening started");
-        setIsListening(true);
-      };
-
-      recognition.onresult = (event: any) => {
-        gotResult = true;
-        const result = event.results[event.resultIndex];
-        if (result.isFinal) {
-          const text = result[0].transcript;
-          log("STT: got final result:", text);
-          setIsListening(false);
-          if (text.trim()) {
-            sendToAI(text);
-          } else {
-            log("STT: empty result, restarting");
-            setTimeout(() => startListening(), 300);
-          }
-        }
-      };
-
-      recognition.onerror = (event: any) => {
-        setIsListening(false);
-        const errCode = event.error;
-        log("STT error:", errCode);
-
-        if (errCode === "no-speech") {
-          // No speech detected — just restart
-          setTimeout(() => startListening(), 300);
-        } else if (errCode === "aborted") {
-          // Intentionally stopped (e.g., by mute or end interview)
-        } else if (errCode === "not-allowed") {
-          setError(
-            "Microphone access denied. Click the lock icon in the address bar, allow microphone, then reload."
-          );
-        } else if (errCode === "audio-capture") {
-          setError(
-            "No microphone found. Please connect a microphone and reload."
-          );
-        } else if (errCode === "network") {
-          setTimeout(() => startListening(), 1000);
-        } else {
-          console.error("Speech recognition error:", errCode);
-          setTimeout(() => startListening(), 1000);
-        }
-      };
-
-      recognition.onend = () => {
-        log("STT: recognition ended, gotResult:", gotResult);
-        setIsListening(false);
-        // If onend fires without a result or error, restart listening.
-        // This handles the case where Chrome silently stops recognition.
-        if (!gotResult && statusRef.current === "active" && !isMutedRef.current) {
-          log("STT: no result on end, restarting");
-          setTimeout(() => startListening(), 300);
-        }
-      };
-
       recognition.start();
     } catch (err) {
-      console.error("Failed to start speech recognition:", err);
+      console.error("Failed to start recognition:", err);
       setTimeout(() => startListening(), 1000);
     }
   }
 
-  async function sendToAI(userMessage: string) {
-    if (!userMessage.trim()) return;
+  // ---- Send to AI ----
 
-    log("sendToAI:", userMessage.substring(0, 60));
-    setTranscript((prev) => [...prev, { speaker: "user", text: userMessage }]);
+  async function sendToAI(userMessage: string) {
+    if (!userMessage.trim() || isProcessingRef.current) return;
+
+    isProcessingRef.current = true;
     setIsProcessing(true);
+    log("sendToAI:", userMessage.substring(0, 80));
+
+    setTranscript((prev) => [...prev, { speaker: "user", text: userMessage }]);
 
     try {
       const data = await apiPost<ChatResponse>(
@@ -304,17 +345,15 @@ export default function InterviewPage() {
 
       log("AI response received:", data.response.substring(0, 60));
       if (data.topic) setCurrentTopic(data.topic);
+      setTranscript((prev) => [...prev, { speaker: "ai", text: data.response }]);
 
-      setTranscript((prev) => [
-        ...prev,
-        { speaker: "ai", text: data.response },
-      ]);
+      isProcessingRef.current = false;
       setIsProcessing(false);
 
-      // Speak the AI response (awaits until speech finishes or safety timeout)
+      // Speak AI response (user can interrupt this)
       await speakText(data.response);
 
-      // Check if interview is wrapping up
+      // Check if interview wrapping up
       const lower = data.response.toLowerCase();
       if (
         lower.includes("wraps up our interview") ||
@@ -322,38 +361,35 @@ export default function InterviewPage() {
         lower.includes("end of our interview") ||
         lower.includes("that's all the questions")
       ) {
-        log("Interview wrap-up detected, ending...");
+        log("Interview wrap-up detected");
         setTimeout(() => endInterview(), 2000);
-        return;
       }
-
-      // Continue the loop: start listening again
-      log("sendToAI: AI done speaking, restarting listener");
-      startListening();
+      // Note: recognition is already running continuously, no need to restart
     } catch (err) {
       console.error("Chat error:", err);
+      isProcessingRef.current = false;
       setIsProcessing(false);
       setTranscript((prev) => [
         ...prev,
-        {
-          speaker: "ai",
-          text: "Sorry, I had a brief technical issue. Could you repeat that?",
-        },
+        { speaker: "ai", text: "Sorry, I had a brief technical issue. Could you repeat that?" },
       ]);
-      await speakText(
-        "Sorry, I had a brief technical issue. Could you repeat that?"
-      );
-      startListening();
+      await speakText("Sorry, I had a brief technical issue. Could you repeat that?");
     }
   }
+
+  // ---- End interview ----
 
   async function endInterview() {
     if (interviewEndedRef.current) return;
     interviewEndedRef.current = true;
 
     log("Ending interview...");
+    // Clear any pending silence timer
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    speechBufferRef.current = "";
+
     stopListening();
-    if (synthRef.current) synthRef.current.cancel();
+    cancelSpeech();
     statusRef.current = "generating_review";
     setStatus("generating_review");
 
@@ -371,7 +407,8 @@ export default function InterviewPage() {
     }
   }
 
-  // ---- Initialize the interview ----
+  // ---- Initialize interview ----
+
   useEffect(() => {
     let cancelled = false;
 
@@ -381,21 +418,16 @@ export default function InterviewPage() {
         await apiPost(`/api/interviews/${interviewId}/start`, {});
         if (cancelled) return;
 
-        // Update BOTH state and ref synchronously
         statusRef.current = "active";
         setStatus("active");
-        log("Interview status set to active");
 
         const data = await apiPost<ChatResponse>(
           `/api/interviews/${interviewId}/chat`,
-          {
-            message: "Hello, I'm ready to start the interview.",
-            interview_id: interviewId,
-          }
+          { message: "Hello, I'm ready to start the interview.", interview_id: interviewId }
         );
         if (cancelled) return;
 
-        log("Got initial AI response:", data.response.substring(0, 60));
+        log("Got greeting:", data.response.substring(0, 60));
         if (data.topic) setCurrentTopic(data.topic);
         setTranscript([{ speaker: "ai", text: data.response }]);
 
@@ -403,31 +435,27 @@ export default function InterviewPage() {
         await speakText(data.response);
         if (cancelled) return;
 
-        // Begin the listen loop
-        log("Init complete, starting listen loop");
+        // Start continuous listening
+        log("Init complete — starting continuous listening");
         startListening();
       } catch (err) {
         if (cancelled) return;
         console.error("Failed to start interview:", err);
-        setError(
-          err instanceof Error ? err.message : "Failed to connect to interview"
-        );
+        setError(err instanceof Error ? err.message : "Failed to connect to interview");
         statusRef.current = "error";
         setStatus("error");
       }
     }
 
     initInterview();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interviewId]);
 
   // ---- Toggle mute ----
+
   function toggleMute() {
     if (isMutedRef.current) {
-      // Unmuting
       isMutedRef.current = false;
       setIsMuted(false);
       log("Unmuted");
@@ -435,10 +463,12 @@ export default function InterviewPage() {
         setTimeout(() => startListening(), 300);
       }
     } else {
-      // Muting
       isMutedRef.current = true;
       setIsMuted(true);
       log("Muted");
+      // Clear buffer and timer
+      speechBufferRef.current = "";
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       stopListening();
     }
   }
@@ -517,10 +547,7 @@ export default function InterviewPage() {
               <Clock className="h-3 w-3" />
               {formatTime(elapsedSeconds)}
             </Badge>
-            <Badge
-              variant="outline"
-              className="bg-violet-500/10 text-violet-400"
-            >
+            <Badge variant="outline" className="bg-violet-500/10 text-violet-400">
               {currentTopic}
             </Badge>
             {status === "connecting" && (
@@ -577,14 +604,14 @@ export default function InterviewPage() {
           </div>
           <div className="text-sm font-medium">
             {aiSpeaking ? (
-              <span className="text-violet-400">AI is speaking...</span>
+              <span className="text-violet-400">AI is speaking... (speak to interrupt)</span>
             ) : isProcessing ? (
               <span className="flex items-center gap-2 text-muted-foreground">
                 <Loader2 className="h-3 w-3 animate-spin" />
                 Thinking...
               </span>
             ) : isListening ? (
-              <span className="text-blue-400">Listening to you...</span>
+              <span className="text-blue-400">Listening... (waiting 5s for you to finish)</span>
             ) : status === "connecting" ? (
               <span className="text-muted-foreground">Connecting...</span>
             ) : (

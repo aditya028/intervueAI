@@ -17,6 +17,7 @@ import {
   Plus,
   Loader2,
 } from "lucide-react";
+import { apiPost } from "@/lib/api";
 
 const ROLES = [
   {
@@ -93,24 +94,10 @@ export default function SetupPage() {
     setError(null);
 
     try {
-      const response = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/interviews`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            role: selectedRole,
-            topics: selectedTopics,
-          }),
-        }
-      );
-
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        throw new Error(errData.detail || "Failed to create interview");
-      }
-
-      const data = await response.json();
+      const data = await apiPost<{ id: string }>("/api/interviews", {
+        role: selectedRole,
+        topics: selectedTopics,
+      });
       router.push(`/brief/${data.id}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Something went wrong";

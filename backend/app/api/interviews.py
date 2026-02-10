@@ -1,17 +1,18 @@
-"""Interview API endpoints."""
+"""Interview API endpoints — all protected by JWT auth."""
 
 import logging
-import time
 from uuid import UUID
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 
 from app.core.database import get_db
+from app.core.auth import get_current_user
+from app.core.rate_limit import check_interview_creation_limit, check_chat_limit
+from app.models.user import User
 from app.models.interview import (
     Interview,
     InterviewTopic,
@@ -27,6 +28,8 @@ from app.schemas.interview import (
     InterviewBrief,
     ReviewOut,
     TopicBreakdown,
+    InterviewListItem,
+    InterviewListResponse,
 )
 from app.agents.question_generator import generate_questions
 from app.agents.review_generator import generate_review
@@ -47,18 +50,101 @@ class EndInterviewRequest(BaseModel):
     duration_seconds: int
 
 
+# ---- Helper: verify interview belongs to user ----
+
+async def get_user_interview(
+    interview_id: UUID,
+    user: User,
+    db: AsyncSession,
+    load_options: list | None = None,
+) -> Interview:
+    """Fetch an interview and verify it belongs to the current user."""
+    query = select(Interview).where(Interview.id == interview_id)
+    if load_options:
+        for opt in load_options:
+            query = query.options(opt)
+    result = await db.execute(query)
+    interview = result.scalar_one_or_none()
+
+    if not interview:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    if interview.user_id != user.id:
+        raise HTTPException(status_code=403, detail="You don't have access to this interview")
+    return interview
+
+
 # ---- Endpoints ----
 
+@router.get("", response_model=InterviewListResponse)
+async def list_interviews(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all interviews for the current user (paginated, newest first)."""
+    # Count total
+    count_q = select(func.count(Interview.id)).where(Interview.user_id == current_user.id)
+    total = (await db.execute(count_q)).scalar() or 0
+
+    # Fetch page
+    offset = (page - 1) * per_page
+    result = await db.execute(
+        select(Interview)
+        .options(
+            selectinload(Interview.topics),
+            selectinload(Interview.review),
+        )
+        .where(Interview.user_id == current_user.id)
+        .order_by(Interview.created_at.desc())
+        .offset(offset)
+        .limit(per_page)
+    )
+    interviews = result.scalars().all()
+
+    items = []
+    for iv in interviews:
+        topics = [t.topic_name for t in sorted(iv.topics, key=lambda t: t.order_index)]
+        score = iv.review.overall_score if iv.review else None
+        items.append(InterviewListItem(
+            id=iv.id,
+            role=iv.role,
+            status=iv.status.value if isinstance(iv.status, InterviewStatus) else iv.status,
+            topics=topics,
+            overall_score=score,
+            duration_seconds=iv.duration_seconds,
+            created_at=iv.created_at,
+        ))
+
+    return InterviewListResponse(
+        interviews=items,
+        total=total,
+        page=page,
+        per_page=per_page,
+    )
+
+
 @router.post("", response_model=InterviewOut)
-async def create_interview(data: InterviewCreate, db: AsyncSession = Depends(get_db)):
+async def create_interview(
+    data: InterviewCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Create a new interview and generate questions."""
+    # Rate limit: 5 interviews per hour
+    await check_interview_creation_limit(str(current_user.id))
+
     if data.role not in ("sde", "intern", "learning"):
         raise HTTPException(status_code=400, detail="Invalid role. Must be: sde, intern, or learning")
 
     if not data.topics or len(data.topics) == 0:
         raise HTTPException(status_code=400, detail="At least one topic is required")
 
-    interview = Interview(role=data.role, status=InterviewStatus.CREATED)
+    interview = Interview(
+        user_id=current_user.id,
+        role=data.role,
+        status=InterviewStatus.CREATED,
+    )
     db.add(interview)
     await db.flush()
 
@@ -119,33 +205,33 @@ async def create_interview(data: InterviewCreate, db: AsyncSession = Depends(get
 
 
 @router.get("/{interview_id}", response_model=InterviewOut)
-async def get_interview(interview_id: UUID, db: AsyncSession = Depends(get_db)):
+async def get_interview(
+    interview_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Get interview details."""
-    result = await db.execute(
-        select(Interview)
-        .options(selectinload(Interview.topics))
-        .where(Interview.id == interview_id)
+    interview = await get_user_interview(
+        interview_id, current_user, db,
+        load_options=[selectinload(Interview.topics)],
     )
-    interview = result.scalar_one_or_none()
-    if not interview:
-        raise HTTPException(status_code=404, detail="Interview not found")
     return interview
 
 
 @router.get("/{interview_id}/brief", response_model=InterviewBrief)
-async def get_interview_brief(interview_id: UUID, db: AsyncSession = Depends(get_db)):
+async def get_interview_brief(
+    interview_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Get the pre-interview brief with focus areas."""
-    result = await db.execute(
-        select(Interview)
-        .options(
+    interview = await get_user_interview(
+        interview_id, current_user, db,
+        load_options=[
             selectinload(Interview.topics),
             selectinload(Interview.questions),
-        )
-        .where(Interview.id == interview_id)
+        ],
     )
-    interview = result.scalar_one_or_none()
-    if not interview:
-        raise HTTPException(status_code=404, detail="Interview not found")
 
     topics = [t.topic_name for t in sorted(interview.topics, key=lambda t: t.order_index)]
     total_questions = len(interview.questions)
@@ -178,21 +264,20 @@ async def get_interview_brief(interview_id: UUID, db: AsyncSession = Depends(get
 
 
 @router.get("/{interview_id}/questions")
-async def get_interview_questions(interview_id: UUID, db: AsyncSession = Depends(get_db)):
-    """Get all questions for an interview (used by the interview page)."""
-    result = await db.execute(
-        select(Interview)
-        .options(
+async def get_interview_questions(
+    interview_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get all questions for an interview."""
+    interview = await get_user_interview(
+        interview_id, current_user, db,
+        load_options=[
             selectinload(Interview.topics),
             selectinload(Interview.questions),
-        )
-        .where(Interview.id == interview_id)
+        ],
     )
-    interview = result.scalar_one_or_none()
-    if not interview:
-        raise HTTPException(status_code=404, detail="Interview not found")
 
-    # Build questions list with topic names
     questions = []
     for q in sorted(interview.questions, key=lambda x: x.order_index):
         topic = next((t for t in interview.topics if t.id == q.topic_id), None)
@@ -216,14 +301,13 @@ async def get_interview_questions(interview_id: UUID, db: AsyncSession = Depends
 
 
 @router.post("/{interview_id}/start")
-async def start_interview(interview_id: UUID, db: AsyncSession = Depends(get_db)):
+async def start_interview(
+    interview_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Mark interview as started."""
-    result = await db.execute(
-        select(Interview).where(Interview.id == interview_id)
-    )
-    interview = result.scalar_one_or_none()
-    if not interview:
-        raise HTTPException(status_code=404, detail="Interview not found")
+    interview = await get_user_interview(interview_id, current_user, db)
 
     interview.status = InterviewStatus.IN_PROGRESS
     interview.started_at = datetime.utcnow()
@@ -235,45 +319,38 @@ async def start_interview(interview_id: UUID, db: AsyncSession = Depends(get_db)
 async def chat_with_interviewer(
     interview_id: UUID,
     data: ChatMessage,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Send a message to the AI interviewer and get a response.
-    This is the text-based interview interaction endpoint.
-    The frontend handles STT (speech-to-text) and TTS (text-to-speech).
-    """
+    """Send a message to the AI interviewer and get a response."""
     from groq import AsyncGroq
     from app.core.config import settings
 
-    # Get interview with questions and transcript
-    result = await db.execute(
-        select(Interview)
-        .options(
+    # Rate limit: 60 messages per minute
+    await check_chat_limit(str(current_user.id))
+
+    interview = await get_user_interview(
+        interview_id, current_user, db,
+        load_options=[
             selectinload(Interview.topics),
             selectinload(Interview.questions),
             selectinload(Interview.transcript_entries),
-        )
-        .where(Interview.id == interview_id)
+        ],
     )
-    interview = result.scalar_one_or_none()
-    if not interview:
-        raise HTTPException(status_code=404, detail="Interview not found")
 
-    # Build conversation history from existing transcript FIRST (before saving current msg)
+    # Build conversation history from existing transcript FIRST
     existing_entries = sorted(interview.transcript_entries, key=lambda e: e.timestamp)
     messages = []
 
-    # Build system prompt with question context
     topics = [t.topic_name for t in sorted(interview.topics, key=lambda t: t.order_index)]
     questions = sorted(interview.questions, key=lambda q: q.order_index)
 
-    # Figure out which question we're on based on how many AI turns have happened
     agent_turns = [e for e in existing_entries if e.speaker == "agent"]
     question_index = min(len(agent_turns), len(questions) - 1) if questions else 0
 
     current_q = questions[question_index] if question_index < len(questions) else None
     current_topic_obj = next((t for t in interview.topics if current_q and t.id == current_q.topic_id), None)
 
-    # Build question bank context (current + next few)
     remaining_qs = questions[question_index:question_index + 5]
     q_context = []
     for q in remaining_qs:
@@ -328,15 +405,12 @@ TONE: Professional but friendly. Encouraging. Like a senior engineer giving a su
 
     messages.append({"role": "system", "content": system_prompt})
 
-    # Add existing conversation history (doesn't include current user message)
     for entry in existing_entries:
         role = "assistant" if entry.speaker == "agent" else "user"
         messages.append({"role": role, "content": entry.text})
 
-    # Add current user message (only once — not yet saved to DB)
     messages.append({"role": "user", "content": data.message})
 
-    # Call Groq LLM
     try:
         client = AsyncGroq(api_key=settings.GROQ_API_KEY)
         response = await client.chat.completions.create(
@@ -345,14 +419,12 @@ TONE: Professional but friendly. Encouraging. Like a senior engineer giving a su
             temperature=0.7,
             max_tokens=500,
         )
-
         ai_response = response.choices[0].message.content or "I'm sorry, could you repeat that?"
-
     except Exception as e:
         logger.error(f"LLM chat failed: {e}")
         ai_response = "I'm experiencing a brief technical issue. Could you repeat your answer?"
 
-    # Now save BOTH the user message and AI response to transcript
+    # Save both messages to transcript
     user_entry = TranscriptEntry(
         interview_id=interview.id,
         speaker="candidate",
@@ -379,37 +451,32 @@ TONE: Professional but friendly. Encouraging. Like a senior engineer giving a su
 async def end_interview(
     interview_id: UUID,
     data: EndInterviewRequest,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """End interview and trigger review generation."""
-    result = await db.execute(
-        select(Interview)
-        .options(
+    interview = await get_user_interview(
+        interview_id, current_user, db,
+        load_options=[
             selectinload(Interview.topics),
             selectinload(Interview.questions),
             selectinload(Interview.transcript_entries),
             selectinload(Interview.question_results),
-        )
-        .where(Interview.id == interview_id)
+        ],
     )
-    interview = result.scalar_one_or_none()
-    if not interview:
-        raise HTTPException(status_code=404, detail="Interview not found")
 
-    # Update interview status
     interview.status = InterviewStatus.COMPLETED
     interview.ended_at = datetime.utcnow()
     interview.duration_seconds = data.duration_seconds
     await db.flush()
 
-    # Generate review using Agent 3
     try:
         topics = [t.topic_name for t in sorted(interview.topics, key=lambda t: t.order_index)]
         transcript = [
             {"speaker": e.speaker, "text": e.text, "timestamp": e.timestamp.isoformat()}
             for e in sorted(interview.transcript_entries, key=lambda e: e.timestamp)
         ]
-        questions = [
+        questions_data = [
             {
                 "id": str(q.id),
                 "question_text": q.question_text,
@@ -432,11 +499,10 @@ async def end_interview(
             role=interview.role,
             topics=topics,
             transcript=transcript,
-            questions=questions,
+            questions=questions_data,
             question_results=question_results,
         )
 
-        # Save review
         review = Review(
             interview_id=interview.id,
             overall_score=review_data.get("overall_score", 0),
@@ -460,8 +526,15 @@ async def end_interview(
 
 
 @router.get("/{interview_id}/review", response_model=ReviewOut)
-async def get_review(interview_id: UUID, db: AsyncSession = Depends(get_db)):
+async def get_review(
+    interview_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Get the interview review."""
+    # Verify ownership
+    await get_user_interview(interview_id, current_user, db)
+
     result = await db.execute(
         select(Review).where(Review.interview_id == interview_id)
     )

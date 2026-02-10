@@ -1,3 +1,5 @@
+"use client";
+
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import {
@@ -9,9 +11,15 @@ import {
   Zap,
   Target,
   MessageSquare,
+  History,
+  LogOut,
+  User,
 } from "lucide-react";
+import { useAuth } from "@/context/auth-context";
 
 export default function Home() {
+  const { user, logout, isLoading } = useAuth();
+
   return (
     <div className="flex min-h-screen flex-col">
       {/* Navigation */}
@@ -36,9 +44,45 @@ export default function Home() {
             >
               Features
             </Link>
-            <Link href="/setup">
-              <Button size="sm">Start Interview</Button>
-            </Link>
+
+            {!isLoading && user ? (
+              <>
+                <Link
+                  href="/history"
+                  className="hidden text-sm text-muted-foreground transition-colors hover:text-foreground sm:flex sm:items-center sm:gap-1.5"
+                >
+                  <History className="h-3.5 w-3.5" />
+                  History
+                </Link>
+                <Link href="/setup">
+                  <Button size="sm">Start Interview</Button>
+                </Link>
+                <div className="flex items-center gap-2 border-l border-border/40 pl-4">
+                  <div className="flex h-7 w-7 items-center justify-center rounded-full bg-violet-500/10">
+                    <User className="h-3.5 w-3.5 text-violet-400" />
+                  </div>
+                  <span className="hidden text-sm sm:block">{user.name}</span>
+                  <button
+                    onClick={logout}
+                    className="text-muted-foreground transition-colors hover:text-foreground"
+                    title="Logout"
+                  >
+                    <LogOut className="h-4 w-4" />
+                  </button>
+                </div>
+              </>
+            ) : !isLoading ? (
+              <>
+                <Link href="/login">
+                  <Button variant="ghost" size="sm">
+                    Sign In
+                  </Button>
+                </Link>
+                <Link href="/register">
+                  <Button size="sm">Get Started</Button>
+                </Link>
+              </>
+            ) : null}
           </div>
         </div>
       </nav>
@@ -75,12 +119,12 @@ export default function Home() {
 
           {/* CTA Buttons */}
           <div className="flex flex-col items-center gap-4 sm:flex-row sm:justify-center">
-            <Link href="/setup">
+            <Link href={user ? "/setup" : "/register"}>
               <Button
                 size="lg"
                 className="gap-2 bg-gradient-to-r from-violet-500 to-blue-500 text-white hover:from-violet-600 hover:to-blue-600"
               >
-                Start Interview
+                {user ? "Start Interview" : "Get Started Free"}
                 <ArrowRight className="h-4 w-4" />
               </Button>
             </Link>
@@ -128,7 +172,6 @@ export default function Home() {
           </div>
 
           <div className="grid gap-8 sm:grid-cols-3">
-            {/* Step 1 */}
             <div className="group relative rounded-2xl border border-border/60 bg-card/50 p-8 transition-all hover:border-violet-500/40 hover:bg-card">
               <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-violet-500/10 text-violet-400 transition-colors group-hover:bg-violet-500/20">
                 <Target className="h-6 w-6" />
@@ -144,7 +187,6 @@ export default function Home() {
               </p>
             </div>
 
-            {/* Step 2 */}
             <div className="group relative rounded-2xl border border-border/60 bg-card/50 p-8 transition-all hover:border-blue-500/40 hover:bg-card">
               <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-blue-500/10 text-blue-400 transition-colors group-hover:bg-blue-500/20">
                 <Mic className="h-6 w-6" />
@@ -162,7 +204,6 @@ export default function Home() {
               </p>
             </div>
 
-            {/* Step 3 */}
             <div className="group relative rounded-2xl border border-border/60 bg-card/50 p-8 transition-all hover:border-indigo-500/40 hover:bg-card">
               <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-indigo-500/10 text-indigo-400 transition-colors group-hover:bg-indigo-500/20">
                 <FileText className="h-6 w-6" />
@@ -196,7 +237,6 @@ export default function Home() {
           </div>
 
           <div className="grid gap-6 sm:grid-cols-2">
-            {/* Feature 1 */}
             <div className="rounded-2xl border border-border/60 bg-card/50 p-8">
               <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-lg bg-violet-500/10">
                 <Mic className="h-5 w-5 text-violet-400" />
@@ -211,7 +251,6 @@ export default function Home() {
               </p>
             </div>
 
-            {/* Feature 2 */}
             <div className="rounded-2xl border border-border/60 bg-card/50 p-8">
               <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-lg bg-blue-500/10">
                 <Brain className="h-5 w-5 text-blue-400" />
@@ -226,7 +265,6 @@ export default function Home() {
               </p>
             </div>
 
-            {/* Feature 3 */}
             <div className="rounded-2xl border border-border/60 bg-card/50 p-8">
               <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-lg bg-indigo-500/10">
                 <Clock className="h-5 w-5 text-indigo-400" />
@@ -240,7 +278,6 @@ export default function Home() {
               </p>
             </div>
 
-            {/* Feature 4 */}
             <div className="rounded-2xl border border-border/60 bg-card/50 p-8">
               <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-lg bg-emerald-500/10">
                 <MessageSquare className="h-5 w-5 text-emerald-400" />
@@ -264,15 +301,14 @@ export default function Home() {
             Ready to Practice?
           </h2>
           <p className="mb-8 text-lg text-muted-foreground">
-            Set up your interview in under a minute. No payment, no signup
-            hassle.
+            Set up your interview in under a minute. Free to get started.
           </p>
-          <Link href="/setup">
+          <Link href={user ? "/setup" : "/register"}>
             <Button
               size="lg"
               className="gap-2 bg-gradient-to-r from-violet-500 to-blue-500 text-white hover:from-violet-600 hover:to-blue-600"
             >
-              Start Your Interview
+              {user ? "Start Your Interview" : "Create Free Account"}
               <ArrowRight className="h-4 w-4" />
             </Button>
           </Link>

@@ -88,3 +88,22 @@ class LiveKitTokenOut(BaseModel):
     token: str
     room_id: str
     url: str
+
+
+# ---- History / List Schemas ----
+
+class InterviewListItem(BaseModel):
+    id: UUID
+    role: str
+    status: str
+    topics: list[str]
+    overall_score: float | None = None
+    duration_seconds: int | None = None
+    created_at: datetime
+
+
+class InterviewListResponse(BaseModel):
+    interviews: list[InterviewListItem]
+    total: int
+    page: int
+    per_page: int

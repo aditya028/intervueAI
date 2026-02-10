@@ -20,6 +20,7 @@ class Interview(Base):
     __tablename__ = "interviews"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     role = Column(String(50), nullable=False)  # sde, intern, learning
     status = Column(SAEnum(InterviewStatus), default=InterviewStatus.CREATED, nullable=False)
     livekit_room_id = Column(String(255), nullable=True)
@@ -29,6 +30,7 @@ class Interview(Base):
     duration_seconds = Column(Integer, nullable=True)
 
     # Relationships
+    user = relationship("User", back_populates="interviews")
     topics = relationship("InterviewTopic", back_populates="interview", cascade="all, delete-orphan")
     questions = relationship("Question", back_populates="interview", cascade="all, delete-orphan")
     transcript_entries = relationship("TranscriptEntry", back_populates="interview", cascade="all, delete-orphan")

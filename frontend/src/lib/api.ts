@@ -1,7 +1,36 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const TOKEN_KEY = "intervueai_token";
+
+function getAuthHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  if (typeof window !== "undefined") {
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+  }
+
+  return headers;
+}
 
 export async function apiGet<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`);
+  const res = await fetch(`${API_URL}${path}`, {
+    headers: getAuthHeaders(),
+  });
+
+  if (res.status === 401) {
+    // Token expired — clear session and redirect to login
+    if (typeof window !== "undefined") {
+      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem("intervueai_user");
+      window.location.href = "/login";
+    }
+    throw new Error("Session expired. Please log in again.");
+  }
+
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(error.detail || "API request failed");
@@ -12,9 +41,24 @@ export async function apiGet<T>(path: string): Promise<T> {
 export async function apiPost<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: getAuthHeaders(),
     body: JSON.stringify(body),
   });
+
+  if (res.status === 401) {
+    if (typeof window !== "undefined") {
+      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem("intervueai_user");
+      window.location.href = "/login";
+    }
+    throw new Error("Session expired. Please log in again.");
+  }
+
+  if (res.status === 429) {
+    const error = await res.json().catch(() => ({ detail: "Too many requests. Please slow down." }));
+    throw new Error(error.detail || "Rate limit exceeded. Please try again later.");
+  }
+
   if (!res.ok) {
     const error = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(error.detail || "API request failed");
@@ -83,4 +127,21 @@ export interface ReviewData {
   suggestions: string[];
   verdict: string;
   created_at: string;
+}
+
+export interface InterviewListItem {
+  id: string;
+  role: string;
+  status: string;
+  topics: string[];
+  overall_score: number | null;
+  duration_seconds: number | null;
+  created_at: string;
+}
+
+export interface InterviewListResponse {
+  interviews: InterviewListItem[];
+  total: number;
+  page: number;
+  per_page: number;
 }
