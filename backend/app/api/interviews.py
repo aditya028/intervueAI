@@ -33,6 +33,7 @@ from app.schemas.interview import (
 )
 from app.agents.question_generator import generate_questions
 from app.agents.review_generator import generate_review
+from app.services.tts_service import TTSService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/interviews", tags=["interviews"])
@@ -440,8 +441,16 @@ TONE: Professional but friendly. Encouraging. Like a senior engineer giving a su
     db.add(ai_entry)
     await db.commit()
 
+    # Generate TTS Audio
+    audio_base64 = ""
+    try:
+        audio_base64 = await TTSService.generate_audio(ai_response)
+    except Exception as e:
+        logger.error(f"TTS generation failed: {e}")
+
     return {
         "response": ai_response,
+        "audio": audio_base64,
         "question_index": question_index,
         "topic": current_topic_obj.topic_name if current_topic_obj else "General",
     }

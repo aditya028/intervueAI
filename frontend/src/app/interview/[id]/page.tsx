@@ -62,6 +62,7 @@ export default function InterviewPage() {
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isProcessingRef = useRef(false);
   const aiSpeakingRef = useRef(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // Auto-scroll transcript
   useEffect(() => {
@@ -116,6 +117,38 @@ export default function InterviewPage() {
   }
 
   // ---- TTS with Chrome workarounds ----
+
+  function playAudio(base64Audio: string): Promise<void> {
+    return new Promise((resolve) => {
+      // Decode base64
+      const audio = new Audio(`data:audio/mp3;base64,${base64Audio}`);
+      audioRef.current = audio;
+      aiSpeakingRef.current = true;
+      setAiSpeaking(true);
+
+      audio.onended = () => {
+        aiSpeakingRef.current = false;
+        setAiSpeaking(false);
+        audioRef.current = null;
+        resolve();
+      };
+
+      audio.onerror = (e) => {
+        console.error("Audio playback error:", e);
+        aiSpeakingRef.current = false;
+        setAiSpeaking(false);
+        audioRef.current = null;
+        resolve();
+      };
+
+      audio.play().catch((e) => {
+        console.error("Audio play failed:", e);
+        aiSpeakingRef.current = false;
+        setAiSpeaking(false);
+        resolve();
+      });
+    });
+  }
 
   function speakText(text: string): Promise<void> {
     return new Promise((resolve) => {
@@ -181,8 +214,14 @@ export default function InterviewPage() {
 
   /** Stop AI speech immediately (for user interruption). */
   function cancelSpeech() {
+    // Cancel browser TTS
     if (synthRef.current) {
       synthRef.current.cancel();
+    }
+    // Cancel audio playback
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
     }
     aiSpeakingRef.current = false;
     setAiSpeaking(false);
@@ -351,7 +390,11 @@ export default function InterviewPage() {
       setIsProcessing(false);
 
       // Speak AI response (user can interrupt this)
-      await speakText(data.response);
+      if (data.audio) {
+        await playAudio(data.audio);
+      } else {
+        await speakText(data.response);
+      }
 
       // Check if interview wrapping up
       const lower = data.response.toLowerCase();
@@ -432,7 +475,11 @@ export default function InterviewPage() {
         setTranscript([{ speaker: "ai", text: data.response }]);
 
         // Speak the greeting
-        await speakText(data.response);
+        if (data.audio) {
+          await playAudio(data.audio);
+        } else {
+          await speakText(data.response);
+        }
         if (cancelled) return;
 
         // Start continuous listening
@@ -574,13 +621,12 @@ export default function InterviewPage() {
         {/* AI Visualizer */}
         <div className="mb-8 flex flex-col items-center">
           <div
-            className={`relative mb-6 flex h-32 w-32 items-center justify-center rounded-full border-2 transition-all duration-500 ${
-              aiSpeaking
-                ? "border-violet-500 bg-violet-500/10 shadow-lg shadow-violet-500/20"
-                : isListening
-                  ? "border-blue-500 bg-blue-500/10 shadow-lg shadow-blue-500/20"
-                  : "border-border/60 bg-card/50"
-            }`}
+            className={`relative mb-6 flex h-32 w-32 items-center justify-center rounded-full border-2 transition-all duration-500 ${aiSpeaking
+              ? "border-violet-500 bg-violet-500/10 shadow-lg shadow-violet-500/20"
+              : isListening
+                ? "border-blue-500 bg-blue-500/10 shadow-lg shadow-blue-500/20"
+                : "border-border/60 bg-card/50"
+              }`}
           >
             {aiSpeaking && (
               <>
@@ -641,11 +687,10 @@ export default function InterviewPage() {
                 {transcript.map((entry, i) => (
                   <div key={i} className="text-sm">
                     <span
-                      className={`font-medium ${
-                        entry.speaker === "ai"
-                          ? "text-violet-400"
-                          : "text-blue-400"
-                      }`}
+                      className={`font-medium ${entry.speaker === "ai"
+                        ? "text-violet-400"
+                        : "text-blue-400"
+                        }`}
                     >
                       {entry.speaker === "ai" ? "AI Interviewer" : "You"}:
                     </span>{" "}
@@ -665,13 +710,12 @@ export default function InterviewPage() {
           <Button
             variant="outline"
             size="lg"
-            className={`h-14 w-14 rounded-full p-0 ${
-              isMuted
-                ? "border-red-500/40 bg-red-500/10 text-red-400"
-                : isListening
-                  ? "border-blue-500/40 bg-blue-500/10 text-blue-400"
-                  : "border-border/60"
-            }`}
+            className={`h-14 w-14 rounded-full p-0 ${isMuted
+              ? "border-red-500/40 bg-red-500/10 text-red-400"
+              : isListening
+                ? "border-blue-500/40 bg-blue-500/10 text-blue-400"
+                : "border-border/60"
+              }`}
             onClick={toggleMute}
           >
             {isMuted ? (

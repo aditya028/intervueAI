@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     LIVEKIT_API_KEY: str = ""
     LIVEKIT_API_SECRET: str = ""
 
+    # TTS
+    TTS_PROVIDER: str = "auto"  # auto, elevenlabs, openai, edge
+    ELEVENLABS_API_KEY: str = ""
+    ELEVENLABS_VOICE_ID: str = "JBFqnCBsd6RMkjVDRZzb"  # George (British, warm)
+    OPENAI_API_KEY: str = ""
+    OPENAI_TTS_VOICE: str = "ash"
+
     # Interview settings
     INTERVIEW_DURATION_MINUTES: int = 60
     INTERVIEW_MAX_DURATION_MINUTES: int = 75  # 1hr 15min max

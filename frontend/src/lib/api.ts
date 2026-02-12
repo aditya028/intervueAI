@@ -103,6 +103,7 @@ export interface InterviewQuestionsData {
 
 export interface ChatResponse {
   response: string;
+  audio?: string;
   question_index: number;
   topic: string;
 }
