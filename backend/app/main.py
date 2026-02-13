@@ -10,11 +10,10 @@ from app.core.database import engine, Base
 from app.api.interviews import router as interviews_router
 from app.api.auth import router as auth_router
 
+from app.core.logging_config import setup_logging
+
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+setup_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
